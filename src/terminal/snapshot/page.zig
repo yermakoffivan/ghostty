@@ -66,8 +66,41 @@ const terminal_hyperlink = @import("../hyperlink.zig");
 const terminal_page = @import("../page.zig");
 const terminal_style = @import("../style.zig");
 
+// Frequent constants we use
+const TerminalHyperlink = terminal_hyperlink.Hyperlink;
+const TerminalHyperlinkPageEntry = terminal_hyperlink.PageEntry;
+const TerminalHyperlinkSet = terminal_hyperlink.Set;
+const TerminalPage = terminal_page.Page;
+const TerminalPageCapacity = terminal_page.Capacity;
+const TerminalStyle = terminal_style.Style;
+const TerminalStyleId = terminal_style.Id;
+const TerminalStyleSet = terminal_style.Set;
+
 /// Errors possible while encoding the native PAGE prefix.
 pub const EncodeError = hyperlink.EncodeError;
+
+/// Errors possible while decoding the native PAGE prefix.
+pub const DecodeError = style.DecodeError ||
+    Header.CapacityError ||
+    error{
+        /// The hyperlink kind is not defined by snapshot version 0.
+        InvalidKind,
+
+        /// The advertised string capacity cannot hold the encoded hyperlinks.
+        InvalidStringCapacity,
+
+        /// A non-default style was encoded more than once.
+        DuplicateStyle,
+
+        /// A hyperlink was encoded more than once.
+        DuplicateHyperlink,
+
+        /// The default style cannot appear in the non-default style table.
+        DefaultStyle,
+
+        /// Native page backing memory could not be allocated.
+        OutOfMemory,
+    };
 
 /// Encode the PAGE header and lookup tables directly from a native page.
 ///
@@ -75,7 +108,7 @@ pub const EncodeError = hyperlink.EncodeError;
 /// be appended by a later increment. The page is iterated in place and no
 /// temporary storage is allocated or retained.
 pub fn encode(
-    page: *const terminal_page.Page,
+    page: *const TerminalPage,
     writer: *std.Io.Writer,
 ) EncodeError!void {
     // Write header
@@ -92,6 +125,55 @@ pub fn encode(
     while (hyperlink_it.next()) |entry| {
         try hyperlink.encode(pageHyperlink(page, entry.value_ptr), writer);
     }
+}
+
+/// Decode the PAGE header and lookup tables directly into a native page.
+///
+/// The fixed header is validated before allocating the page. Style entries
+/// are inserted directly into the page style set, while hyperlink strings are
+/// read into the page string allocator before their native entries are
+/// inserted. No caller-owned table or string buffers are required.
+///
+/// Only the currently implemented PAGE prefix is consumed. Rows and cells
+/// will be decoded by a later increment.
+pub fn decode(
+    reader: *std.Io.Reader,
+) DecodeError!TerminalPage {
+    // Decode the header, validate capacities, init page
+    const header = try Header.decode(reader);
+    const capacity = try header.pageCapacity();
+    var page = TerminalPage.init(capacity) catch
+        return error.OutOfMemory;
+    errdefer page.deinit();
+
+    // Styles
+    for (0..header.style_count) |wire_index| {
+        const value = try style.decode(reader);
+        if (value.default()) return error.DefaultStyle;
+
+        const native_id = page.styles.add(
+            page.memory,
+            value,
+        ) catch return error.InvalidStyleCapacity;
+        if (native_id != wire_index + 1) return error.DuplicateStyle;
+    }
+
+    // Hyperlinks
+    for (0..header.hyperlink_count) |wire_index| {
+        const native_id = hyperlink.decodePage(
+            &page,
+            reader,
+        ) catch |err| switch (err) {
+            error.StringsOutOfMemory => return error.InvalidStringCapacity,
+            error.SetOutOfMemory,
+            error.SetNeedsRehash,
+            => return error.InvalidHyperlinkCapacity,
+            else => return err,
+        };
+        if (native_id != wire_index + 1) return error.DuplicateHyperlink;
+    }
+
+    return page;
 }
 
 /// The fixed logical dimensions, table counts, and allocation hints at the
@@ -167,7 +249,7 @@ pub const Header = struct {
     ///
     /// This copies the page's existing allocation capacities. It does not
     /// scan cells, allocate, or encode any bytes.
-    fn init(page: *const terminal_page.Page) Header {
+    fn init(page: *const TerminalPage) Header {
         return .{
             .columns = page.size.cols,
             .rows = page.size.rows,
@@ -177,6 +259,44 @@ pub const Header = struct {
             .hyperlink_capacity_bytes = page.capacity.hyperlink_bytes,
             .grapheme_capacity_bytes = page.capacity.grapheme_bytes,
             .string_capacity_bytes = page.capacity.string_bytes,
+        };
+    }
+
+    pub const CapacityError = error{
+        InvalidDimensions,
+        InvalidStyleCapacity,
+        InvalidHyperlinkCapacity,
+    };
+
+    /// Validate native allocation requirements and produce the page capacity.
+    fn pageCapacity(self: Header) CapacityError!TerminalPageCapacity {
+        if (self.columns == 0 or self.rows == 0) {
+            return error.InvalidDimensions;
+        }
+
+        const style_layout: TerminalStyleSet.Layout = .init(self.style_capacity);
+        if (self.style_count > style_layout.cap -| 1) {
+            return error.InvalidStyleCapacity;
+        }
+
+        const hyperlink_capacity_count = @divFloor(
+            self.hyperlink_capacity_bytes,
+            @sizeOf(TerminalHyperlinkSet.Item),
+        );
+        const hyperlink_layout: TerminalHyperlinkSet.Layout = .init(
+            hyperlink_capacity_count,
+        );
+        if (self.hyperlink_count > hyperlink_layout.cap -| 1) {
+            return error.InvalidHyperlinkCapacity;
+        }
+
+        return .{
+            .cols = self.columns,
+            .rows = self.rows,
+            .styles = self.style_capacity,
+            .hyperlink_bytes = self.hyperlink_capacity_bytes,
+            .grapheme_bytes = self.grapheme_capacity_bytes,
+            .string_bytes = self.string_capacity_bytes,
         };
     }
 
@@ -198,122 +318,10 @@ pub const Header = struct {
     }
 };
 
-/// The implemented prefix of a PAGE payload: its header and lookup tables.
-///
-/// This borrowed representation does not own either table. Encoding writes
-/// the header, exactly `header.style_count` non-default styles, and exactly
-/// `header.hyperlink_count` unique hyperlinks. Rows and cells will be appended
-/// by later increments.
-pub const Payload = struct {
-    header: Header,
-    styles: []const terminal_style.Style,
-    hyperlinks: []const terminal_hyperlink.Hyperlink,
-
-    pub const EncodeError = hyperlink.EncodeError || error{
-        /// `header.style_count` does not match the provided style slice.
-        StyleCountMismatch,
-
-        /// The default style cannot appear in the non-default style table.
-        DefaultStyle,
-
-        /// `header.hyperlink_count` does not match the provided hyperlink slice.
-        HyperlinkCountMismatch,
-    };
-
-    pub const DecodeError = style.DecodeError || hyperlink.DecodeError || error{
-        /// `header.style_count` does not match the provided style storage.
-        StyleCountMismatch,
-
-        /// The default style cannot appear in the non-default style table.
-        DefaultStyle,
-
-        /// `header.hyperlink_count` does not match the provided hyperlink storage.
-        HyperlinkCountMismatch,
-    };
-
-    /// Caller-owned storage used while decoding the implemented payload prefix.
-    pub const Buffers = struct {
-        /// Exact storage for the non-default style table.
-        styles: []terminal_style.Style,
-
-        /// Exact storage for the unique hyperlink table.
-        hyperlinks: []terminal_hyperlink.Hyperlink,
-
-        /// Storage for explicit hyperlink IDs and URIs. This must be large
-        /// enough for the decoded entries; unused trailing bytes are allowed.
-        hyperlink_strings: []u8,
-    };
-
-    /// Encode the PAGE header and its complete style and hyperlink tables.
-    pub fn encode(
-        self: Payload,
-        writer: *std.Io.Writer,
-    ) Payload.EncodeError!void {
-        // Some purposeful validation here, don't want to just assert
-        // this because its very important to get this right for the wire
-        // format.
-        if (self.styles.len != self.header.style_count) {
-            return error.StyleCountMismatch;
-        }
-        for (self.styles) |entry| {
-            if (entry.default()) return error.DefaultStyle;
-        }
-        if (self.hyperlinks.len != self.header.hyperlink_count) {
-            return error.HyperlinkCountMismatch;
-        }
-
-        // (1) Header
-        // (2) Styles
-        // (3) Hyperlinks
-        try self.header.encode(writer);
-        for (self.styles) |entry| try style.encode(entry, writer);
-        for (self.hyperlinks) |entry| try hyperlink.encode(entry, writer);
-    }
-
-    /// Decode the lookup tables after `header` has already been decoded.
-    ///
-    /// Separating header decoding lets the caller inspect the table counts and
-    /// capacity hints before choosing fixed, stack, pooled, or allocated
-    /// storage. Every buffer remains owned by the caller. Decoded hyperlink
-    /// strings borrow from `buffers.hyperlink_strings`.
-    pub fn decode(
-        header: Header,
-        reader: *std.Io.Reader,
-        buffers: Buffers,
-    ) DecodeError!Payload {
-        if (buffers.styles.len != header.style_count) {
-            return error.StyleCountMismatch;
-        }
-        if (buffers.hyperlinks.len != header.hyperlink_count) {
-            return error.HyperlinkCountMismatch;
-        }
-        for (buffers.styles) |*entry| {
-            entry.* = try style.decode(reader);
-            if (entry.default()) return error.DefaultStyle;
-        }
-
-        var string_offset: usize = 0;
-        for (buffers.hyperlinks) |*entry| {
-            const decoded = try hyperlink.decode(
-                reader,
-                buffers.hyperlink_strings[string_offset..],
-            );
-            entry.* = decoded.value;
-            string_offset += decoded.string_bytes;
-        }
-
-        return .{
-            .header = header,
-            .styles = buffers.styles,
-            .hyperlinks = buffers.hyperlinks,
-        };
-    }
-};
-
 fn pageHyperlink(
-    page: *const terminal_page.Page,
-    entry: *const terminal_hyperlink.PageEntry,
-) terminal_hyperlink.Hyperlink {
+    page: *const TerminalPage,
+    entry: *const TerminalHyperlinkPageEntry,
+) TerminalHyperlink {
     return .{
         .id = switch (entry.id) {
             .implicit => |value| .{ .implicit = value },
@@ -383,7 +391,7 @@ test "reject every truncation" {
 }
 
 test "encode native page lookup tables" {
-    const capacity: terminal_page.Capacity = .{
+    const capacity: TerminalPageCapacity = .{
         .cols = 3,
         .rows = 2,
         .styles = 8,
@@ -391,7 +399,7 @@ test "encode native page lookup tables" {
         .grapheme_bytes = 128,
         .string_bytes = 256,
     };
-    var page = try terminal_page.Page.init(capacity);
+    var page = try TerminalPage.init(capacity);
     defer page.deinit();
 
     const style_a = try page.styles.add(page.memory, .{
@@ -478,56 +486,17 @@ test "encode native page lookup tables" {
     try std.testing.expectEqual(@as(u64, fixture.len), counter.count);
 }
 
-test "payload prefix encodes and decodes lookup tables" {
-    const styles = [_]terminal_style.Style{
-        .{
-            .fg_color = .{ .palette = 42 },
-            .flags = .{ .bold = true },
-        },
-        .{
-            .bg_color = .{ .rgb = .{
-                .r = 0xaa,
-                .g = 0xbb,
-                .b = 0xcc,
-            } },
-            .flags = .{ .underline = .double },
-        },
-    };
-    const hyperlinks = [_]terminal_hyperlink.Hyperlink{
-        .{
-            .id = .{ .implicit = 0x01020304 },
-            .uri = "uri",
-        },
-        .{
-            .id = .{ .explicit = "id" },
-            .uri = "url",
-        },
-    };
+test "decode lookup tables directly into a native page" {
     const header: Header = .{
         .columns = 80,
         .rows = 24,
-        .style_count = styles.len,
-        .hyperlink_count = hyperlinks.len,
+        .style_count = 2,
+        .hyperlink_count = 2,
         .style_capacity = 16,
         .hyperlink_capacity_bytes = 512,
         .grapheme_capacity_bytes = 128,
         .string_capacity_bytes = 256,
     };
-    const payload: Payload = .{
-        .header = header,
-        .styles = &styles,
-        .hyperlinks = &hyperlinks,
-    };
-
-    const encoded_len = comptime len: {
-        break :len Header.len +
-            styles.len * style.len +
-            (hyperlink.encodedLen(hyperlinks[0]) catch unreachable) +
-            (hyperlink.encodedLen(hyperlinks[1]) catch unreachable);
-    };
-    var encoded: [encoded_len]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&encoded);
-    try payload.encode(&writer);
 
     const fixture =
         "\x50\x00\x18\x00\x02\x00\x02\x00" ++
@@ -539,159 +508,222 @@ test "payload prefix encodes and decodes lookup tables" {
         "\x00\x00\x00\x00\x00\x02\x00\x00" ++
         "\x01\x04\x03\x02\x01\x03\x00\x00\x00uri" ++
         "\x02\x02\x00\x00\x00id\x03\x00\x00\x00url";
-    try std.testing.expectEqualStrings(fixture, writer.buffered());
 
-    var source: std.Io.Reader = .fixed(writer.buffered());
+    var source: std.Io.Reader = .fixed(fixture);
     var read_buf: [1]u8 = undefined;
     var limited = source.limited(.unlimited, &read_buf);
-    const decoded_header = try Header.decode(&limited.interface);
-    var decoded_styles: [styles.len]terminal_style.Style = undefined;
-    var decoded_hyperlinks: [hyperlinks.len]terminal_hyperlink.Hyperlink =
-        undefined;
-    var decoded_hyperlink_strings: [8]u8 = undefined;
-    const decoded = try Payload.decode(
-        decoded_header,
-        &limited.interface,
-        .{
-            .styles = &decoded_styles,
-            .hyperlinks = &decoded_hyperlinks,
-            .hyperlink_strings = &decoded_hyperlink_strings,
-        },
-    );
+    var decoded = try decode(&limited.interface);
+    defer decoded.deinit();
 
-    try std.testing.expectEqual(header, decoded.header);
-    for (styles, decoded.styles) |expected, actual| {
-        try std.testing.expect(expected.eql(actual));
-    }
+    try std.testing.expectEqual(header, Header.init(&decoded));
+    try decoded.verifyIntegrity(std.testing.allocator);
+
+    var style_it = decoded.styles.iterator(decoded.memory);
+    const style_a = style_it.next().?;
+    try std.testing.expectEqual(@as(TerminalStyleId, 1), style_a.id);
+    try std.testing.expect((TerminalStyle{
+        .fg_color = .{ .palette = 42 },
+        .flags = .{ .bold = true },
+    }).eql(style_a.value_ptr.*));
+    const style_b = style_it.next().?;
+    try std.testing.expectEqual(@as(TerminalStyleId, 2), style_b.id);
+    try std.testing.expect((TerminalStyle{
+        .bg_color = .{ .rgb = .{
+            .r = 0xaa,
+            .g = 0xbb,
+            .b = 0xcc,
+        } },
+        .flags = .{ .underline = .double },
+    }).eql(style_b.value_ptr.*));
+    try std.testing.expectEqual(null, style_it.next());
+
+    var hyperlink_it = decoded.hyperlink_set.iterator(decoded.memory);
+    const hyperlink_a = pageHyperlink(
+        &decoded,
+        hyperlink_it.next().?.value_ptr,
+    );
     try std.testing.expectEqual(
-        hyperlinks[0].id.implicit,
-        decoded.hyperlinks[0].id.implicit,
+        @as(u32, 0x01020304),
+        hyperlink_a.id.implicit,
     );
-    try std.testing.expectEqualStrings(
-        hyperlinks[0].uri,
-        decoded.hyperlinks[0].uri,
+    try std.testing.expectEqualStrings("uri", hyperlink_a.uri);
+    const hyperlink_b = pageHyperlink(
+        &decoded,
+        hyperlink_it.next().?.value_ptr,
     );
-    try std.testing.expectEqualStrings(
-        hyperlinks[1].id.explicit,
-        decoded.hyperlinks[1].id.explicit,
-    );
-    try std.testing.expectEqualStrings(
-        hyperlinks[1].uri,
-        decoded.hyperlinks[1].uri,
-    );
+    try std.testing.expectEqualStrings("id", hyperlink_b.id.explicit);
+    try std.testing.expectEqualStrings("url", hyperlink_b.uri);
+    try std.testing.expectEqual(null, hyperlink_it.next());
+
+    var reencoded: [fixture.len]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&reencoded);
+    try encode(&decoded, &writer);
+    try std.testing.expectEqualStrings(fixture, writer.buffered());
 }
 
-test "payload prefix validates its style table" {
-    const non_default = [_]terminal_style.Style{
-        .{ .flags = .{ .bold = true } },
+test "decode validates dimensions and native table capacities" {
+    const cases = .{
+        .{
+            .expected = error.InvalidDimensions,
+            .header = Header{
+                .columns = 0,
+                .rows = 24,
+                .style_count = 0,
+                .hyperlink_count = 0,
+                .style_capacity = 0,
+                .hyperlink_capacity_bytes = 0,
+                .grapheme_capacity_bytes = 0,
+                .string_capacity_bytes = 0,
+            },
+        },
+        .{
+            .expected = error.InvalidDimensions,
+            .header = Header{
+                .columns = 80,
+                .rows = 0,
+                .style_count = 0,
+                .hyperlink_count = 0,
+                .style_capacity = 0,
+                .hyperlink_capacity_bytes = 0,
+                .grapheme_capacity_bytes = 0,
+                .string_capacity_bytes = 0,
+            },
+        },
+        .{
+            .expected = error.InvalidStyleCapacity,
+            .header = Header{
+                .columns = 80,
+                .rows = 24,
+                .style_count = 1,
+                .hyperlink_count = 0,
+                .style_capacity = 0,
+                .hyperlink_capacity_bytes = 0,
+                .grapheme_capacity_bytes = 0,
+                .string_capacity_bytes = 0,
+            },
+        },
+        .{
+            .expected = error.InvalidHyperlinkCapacity,
+            .header = Header{
+                .columns = 80,
+                .rows = 24,
+                .style_count = 0,
+                .hyperlink_count = 1,
+                .style_capacity = 0,
+                .hyperlink_capacity_bytes = 0,
+                .grapheme_capacity_bytes = 0,
+                .string_capacity_bytes = 0,
+            },
+        },
     };
+
+    inline for (cases) |case| {
+        var encoded: [Header.len]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&encoded);
+        try case.header.encode(&writer);
+
+        var reader: std.Io.Reader = .fixed(writer.buffered());
+        try std.testing.expectError(case.expected, decode(&reader));
+    }
+}
+
+test "decode rejects duplicate and default style entries" {
     const header: Header = .{
         .columns = 80,
         .rows = 24,
         .style_count = 2,
         .hyperlink_count = 0,
-        .style_capacity = 0,
-        .hyperlink_capacity_bytes = 0,
+        .style_capacity = 16,
+        .hyperlink_capacity_bytes = 512,
         .grapheme_capacity_bytes = 0,
-        .string_capacity_bytes = 0,
+        .string_capacity_bytes = 256,
+    };
+    const duplicate_style: TerminalStyle = .{
+        .flags = .{ .bold = true },
     };
 
-    var encoded: [Header.len + style.len]u8 = undefined;
+    var encoded: [Header.len + 2 * style.len]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&encoded);
-    try std.testing.expectError(
-        error.StyleCountMismatch,
-        (Payload{
-            .header = header,
-            .styles = &non_default,
-            .hyperlinks = &.{},
-        }).encode(&writer),
-    );
-    try std.testing.expectEqual(@as(usize, 0), writer.end);
+    try header.encode(&writer);
+    try style.encode(duplicate_style, &writer);
+    try style.encode(duplicate_style, &writer);
 
-    var reader: std.Io.Reader = .fixed(&.{});
-    var decoded_styles: [1]terminal_style.Style = undefined;
-    var decoded_hyperlinks: [0]terminal_hyperlink.Hyperlink = .{};
-    var decoded_hyperlink_strings: [0]u8 = .{};
-    try std.testing.expectError(
-        error.StyleCountMismatch,
-        Payload.decode(header, &reader, .{
-            .styles = &decoded_styles,
-            .hyperlinks = &decoded_hyperlinks,
-            .hyperlink_strings = &decoded_hyperlink_strings,
-        }),
-    );
+    var reader: std.Io.Reader = .fixed(writer.buffered());
+    try std.testing.expectError(error.DuplicateStyle, decode(&reader));
 
-    const default_styles = [_]terminal_style.Style{.{}};
     const default_header: Header = .{
         .columns = 80,
         .rows = 24,
         .style_count = 1,
         .hyperlink_count = 0,
-        .style_capacity = 0,
+        .style_capacity = 16,
         .hyperlink_capacity_bytes = 0,
         .grapheme_capacity_bytes = 0,
         .string_capacity_bytes = 0,
     };
-    try std.testing.expectError(
-        error.DefaultStyle,
-        (Payload{
-            .header = default_header,
-            .styles = &default_styles,
-            .hyperlinks = &.{},
-        }).encode(&writer),
-    );
+    var default_encoded: [Header.len + style.len]u8 = undefined;
+    var default_writer: std.Io.Writer = .fixed(&default_encoded);
+    try default_header.encode(&default_writer);
+    try style.encode(.{}, &default_writer);
 
-    var default_fixture: [style.len]u8 = @splat(0);
-    var default_reader: std.Io.Reader = .fixed(&default_fixture);
-    var decoded_default: [1]terminal_style.Style = undefined;
-    try std.testing.expectError(
-        error.DefaultStyle,
-        Payload.decode(default_header, &default_reader, .{
-            .styles = &decoded_default,
-            .hyperlinks = &decoded_hyperlinks,
-            .hyperlink_strings = &decoded_hyperlink_strings,
-        }),
-    );
+    var default_reader: std.Io.Reader = .fixed(default_writer.buffered());
+    try std.testing.expectError(error.DefaultStyle, decode(&default_reader));
 }
 
-test "payload prefix validates its hyperlink table" {
-    const hyperlinks = [_]terminal_hyperlink.Hyperlink{.{
-        .id = .{ .implicit = 42 },
-        .uri = "uri",
-    }};
+test "decode rejects duplicate hyperlinks with empty strings" {
     const header: Header = .{
-        .columns = 80,
-        .rows = 24,
+        .columns = 1,
+        .rows = 1,
         .style_count = 0,
         .hyperlink_count = 2,
         .style_capacity = 0,
-        .hyperlink_capacity_bytes = 0,
+        .hyperlink_capacity_bytes = 512,
+        .grapheme_capacity_bytes = 0,
+        .string_capacity_bytes = 0,
+    };
+    const duplicate: TerminalHyperlink = .{
+        .id = .{ .explicit = "" },
+        .uri = "",
+    };
+
+    var encoded: [Header.len + 18]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&encoded);
+    try header.encode(&writer);
+    try hyperlink.encode(duplicate, &writer);
+    try hyperlink.encode(duplicate, &writer);
+
+    var reader: std.Io.Reader = .fixed(writer.buffered());
+    try std.testing.expectError(error.DuplicateHyperlink, decode(&reader));
+}
+
+test "decode reads hyperlink strings into page storage" {
+    const link: TerminalHyperlink = .{
+        .id = .{ .explicit = "id" },
+        .uri = "uri",
+    };
+    const hyperlink_capacity: u16 = @intCast(
+        TerminalHyperlinkSet.capacityForCount(1) *
+            @sizeOf(TerminalHyperlinkSet.Item),
+    );
+    const header: Header = .{
+        .columns = 1,
+        .rows = 1,
+        .style_count = 0,
+        .hyperlink_count = 1,
+        .style_capacity = 0,
+        .hyperlink_capacity_bytes = hyperlink_capacity,
         .grapheme_capacity_bytes = 0,
         .string_capacity_bytes = 0,
     };
 
-    var encoded: [Header.len + 12]u8 = undefined;
+    var encoded: [Header.len + 14]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&encoded);
-    try std.testing.expectError(
-        error.HyperlinkCountMismatch,
-        (Payload{
-            .header = header,
-            .styles = &.{},
-            .hyperlinks = &hyperlinks,
-        }).encode(&writer),
-    );
-    try std.testing.expectEqual(@as(usize, 0), writer.end);
+    try header.encode(&writer);
+    try hyperlink.encode(link, &writer);
 
-    var empty_reader: std.Io.Reader = .fixed(&.{});
-    var decoded_styles: [0]terminal_style.Style = .{};
-    var decoded_hyperlinks: [1]terminal_hyperlink.Hyperlink = undefined;
-    var decoded_strings: [3]u8 = undefined;
+    var reader: std.Io.Reader = .fixed(writer.buffered());
     try std.testing.expectError(
-        error.HyperlinkCountMismatch,
-        Payload.decode(header, &empty_reader, .{
-            .styles = &decoded_styles,
-            .hyperlinks = &decoded_hyperlinks,
-            .hyperlink_strings = &decoded_strings,
-        }),
+        error.InvalidStringCapacity,
+        decode(&reader),
     );
 }

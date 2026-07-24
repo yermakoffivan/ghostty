@@ -34,86 +34,43 @@
 //! Both variants have nine bytes of fixed overhead. The remaining bytes are
 //! the URI plus the explicit ID, when present.
 //!
-//! Decoding never allocates. The caller provides storage for the explicit ID
-//! and URI bytes, and the returned hyperlink borrows slices of that storage.
+//! The standalone decoder returns an allocator-owned hyperlink. PAGE decoding
+//! reads strings directly into the destination page's allocator instead.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const io = @import("io.zig");
 const terminal_hyperlink = @import("../hyperlink.zig");
+const terminal_page = @import("../page.zig");
+const terminal_size = @import("../size.zig");
 
 const Kind = enum(u8) {
     implicit = 1,
     explicit = 2,
 };
 
-/// Errors possible while determining encoded string lengths.
-pub const StringBytesError = error{
-    /// A string cannot fit its `u32` length or local size arithmetic overflowed.
-    StringTooLong,
-};
-
 /// Errors possible while encoding one hyperlink entry.
-pub const EncodeError = std.Io.Writer.Error || StringBytesError;
+pub const EncodeError = std.Io.Writer.Error;
 
-/// Errors possible while decoding one hyperlink entry.
-pub const DecodeError = std.Io.Reader.Error || error{
+/// Errors possible while decoding one allocator-owned hyperlink entry.
+pub const DecodeError = std.Io.Reader.Error || Allocator.Error || error{
     /// The hyperlink kind is not defined by snapshot version 0.
     InvalidKind,
-
-    /// Caller-provided string storage cannot hold the decoded entry.
-    BufferTooSmall,
 };
 
-/// One decoded hyperlink and the number of caller-owned string bytes it uses.
-pub const Decoded = struct {
-    value: terminal_hyperlink.Hyperlink,
-    string_bytes: usize,
-};
-
-/// Return the raw explicit-ID and URI bytes encoded by `value`.
-///
-/// Length prefixes and the numeric implicit ID are not included.
-pub fn stringBytes(
-    value: terminal_hyperlink.Hyperlink,
-) StringBytesError!usize {
-    _ = std.math.cast(u32, value.uri.len) orelse {
-        return error.StringTooLong;
+/// Errors possible while decoding directly into a native page.
+pub const DecodePageError = std.Io.Reader.Error ||
+    terminal_page.Page.InsertHyperlinkError ||
+    error{
+        /// The hyperlink kind is not defined by snapshot version 0.
+        InvalidKind,
     };
-    var result = value.uri.len;
-
-    switch (value.id) {
-        .implicit => {},
-        .explicit => |id| {
-            _ = std.math.cast(u32, id.len) orelse {
-                return error.StringTooLong;
-            };
-            result = std.math.add(usize, result, id.len) catch {
-                return error.StringTooLong;
-            };
-        },
-    }
-
-    return result;
-}
-
-/// Return the complete encoded length of one hyperlink entry.
-pub fn encodedLen(
-    value: terminal_hyperlink.Hyperlink,
-) StringBytesError!usize {
-    const string_bytes = try stringBytes(value);
-    return std.math.add(usize, 9, string_bytes) catch {
-        return error.StringTooLong;
-    };
-}
 
 /// Encode one hyperlink entry.
 pub fn encode(
     value: terminal_hyperlink.Hyperlink,
     writer: *std.Io.Writer,
 ) EncodeError!void {
-    // Validate every length before writing any part of the entry.
-    _ = try stringBytes(value);
-
     switch (value.id) {
         .implicit => |id| {
             try writer.writeByte(@intFromEnum(Kind.implicit));
@@ -131,67 +88,139 @@ pub fn encode(
     }
 }
 
-/// Decode one hyperlink entry into caller-owned string storage.
+/// Decode one allocator-owned hyperlink entry.
 ///
-/// The returned hyperlink remains valid only as long as `strings` remains
-/// valid and unmodified. `string_bytes` identifies the prefix of `strings`
-/// used by this entry.
+/// The caller owns the returned value and must call `Hyperlink.deinit`.
 pub fn decode(
     reader: *std.Io.Reader,
-    strings: []u8,
-) DecodeError!Decoded {
+    alloc: Allocator,
+) DecodeError!terminal_hyperlink.Hyperlink {
     const kind_raw = try reader.takeByte();
-    const kind = std.enums.fromInt(Kind, kind_raw) orelse {
+    const kind = std.enums.fromInt(Kind, kind_raw) orelse
         return error.InvalidKind;
-    };
 
     return switch (kind) {
-        .implicit => decodeImplicit(reader, strings),
-        .explicit => decodeExplicit(reader, strings),
+        .implicit => implicit: {
+            const id = try io.readInt(reader, u32);
+            const uri_len: usize = @intCast(try io.readInt(reader, u32));
+            const uri = try alloc.alloc(u8, uri_len);
+            errdefer alloc.free(uri);
+            try reader.readSliceAll(uri);
+
+            break :implicit .{
+                .id = .{ .implicit = id },
+                .uri = uri,
+            };
+        },
+
+        .explicit => explicit: {
+            const id_len: usize = @intCast(try io.readInt(reader, u32));
+            const id = try alloc.alloc(u8, id_len);
+            errdefer alloc.free(id);
+            try reader.readSliceAll(id);
+
+            const uri_len: usize = @intCast(try io.readInt(reader, u32));
+            const uri = try alloc.alloc(u8, uri_len);
+            errdefer alloc.free(uri);
+            try reader.readSliceAll(uri);
+
+            break :explicit .{
+                .id = .{ .explicit = id },
+                .uri = uri,
+            };
+        },
     };
 }
 
-fn decodeImplicit(
+/// Decode one hyperlink directly into page-owned storage.
+///
+/// Explicit ID and URI bytes are read into the page string allocator and the
+/// completed entry is inserted into the page hyperlink set. The returned ID is
+/// the native page ID assigned to the entry.
+pub fn decodePage(
+    page: *terminal_page.Page,
     reader: *std.Io.Reader,
-    strings: []u8,
-) DecodeError!Decoded {
-    const id = try io.readInt(reader, u32);
-    const uri_len: usize = @intCast(try io.readInt(reader, u32));
-    if (uri_len > strings.len) return error.BufferTooSmall;
+) DecodePageError!terminal_hyperlink.Id {
+    const kind_raw = try reader.takeByte();
+    const kind = std.enums.fromInt(Kind, kind_raw) orelse
+        return error.InvalidKind;
 
-    const uri = strings[0..uri_len];
-    try reader.readSliceAll(uri);
-    return .{
-        .value = .{
-            .id = .{ .implicit = id },
-            .uri = uri,
+    const entry: terminal_hyperlink.PageEntry = switch (kind) {
+        .implicit => implicit: {
+            const id = try io.readInt(reader, u32);
+            const uri_len: usize = @intCast(try io.readInt(reader, u32));
+            const uri = try decodePageString(
+                page,
+                reader,
+                uri_len,
+            );
+
+            break :implicit .{
+                .id = .{ .implicit = id },
+                .uri = uri,
+            };
         },
-        .string_bytes = uri.len,
+
+        .explicit => explicit: {
+            const id_len: usize = @intCast(try io.readInt(reader, u32));
+            const id = try decodePageString(
+                page,
+                reader,
+                id_len,
+            );
+            errdefer if (id.len > 0) page.string_alloc.free(
+                page.memory,
+                id.slice(page.memory),
+            );
+
+            const uri_len: usize = @intCast(try io.readInt(reader, u32));
+            const uri = try decodePageString(
+                page,
+                reader,
+                uri_len,
+            );
+
+            break :explicit .{
+                .id = .{ .explicit = id },
+                .uri = uri,
+            };
+        },
+    };
+    errdefer entry.free(page);
+
+    return page.hyperlink_set.addContext(
+        page.memory,
+        entry,
+        .{ .page = page },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => error.SetOutOfMemory,
+        error.NeedsRehash => error.SetNeedsRehash,
     };
 }
 
-fn decodeExplicit(
+fn decodePageString(
+    page: *terminal_page.Page,
     reader: *std.Io.Reader,
-    strings: []u8,
-) DecodeError!Decoded {
-    const id_len: usize = @intCast(try io.readInt(reader, u32));
-    if (id_len > strings.len) return error.BufferTooSmall;
+    len: usize,
+) (std.Io.Reader.Error || error{StringsOutOfMemory})!terminal_size.Offset(u8).Slice {
+    if (len == 0) return .{};
 
-    const id = strings[0..id_len];
-    try reader.readSliceAll(id);
+    // Allocate space for the string and read directly into it.
+    const value = page.string_alloc.alloc(
+        u8,
+        page.memory,
+        len,
+    ) catch return error.StringsOutOfMemory;
+    errdefer page.string_alloc.free(page.memory, value);
+    try reader.readSliceAll(value);
 
-    const uri_len: usize = @intCast(try io.readInt(reader, u32));
-    const remaining = strings[id.len..];
-    if (uri_len > remaining.len) return error.BufferTooSmall;
-
-    const uri = remaining[0..uri_len];
-    try reader.readSliceAll(uri);
     return .{
-        .value = .{
-            .id = .{ .explicit = id },
-            .uri = uri,
-        },
-        .string_bytes = id.len + uri.len,
+        .len = value.len,
+        .offset = terminal_size.getOffset(
+            u8,
+            page.memory,
+            value.ptr,
+        ),
     };
 }
 
@@ -201,7 +230,7 @@ test "golden implicit encoding" {
         .uri = "uri",
     };
 
-    var buf: [encodedLen(value) catch unreachable]u8 = undefined;
+    var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try encode(value, &writer);
 
@@ -209,7 +238,6 @@ test "golden implicit encoding" {
         "\x01\x04\x03\x02\x01\x03\x00\x00\x00uri",
         writer.buffered(),
     );
-    try std.testing.expectEqual(@as(usize, 3), try stringBytes(value));
 }
 
 test "golden explicit encoding" {
@@ -218,7 +246,7 @@ test "golden explicit encoding" {
         .uri = "uri",
     };
 
-    var buf: [encodedLen(value) catch unreachable]u8 = undefined;
+    var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try encode(value, &writer);
 
@@ -226,7 +254,6 @@ test "golden explicit encoding" {
         "\x02\x02\x00\x00\x00id\x03\x00\x00\x00uri",
         writer.buffered(),
     );
-    try std.testing.expectEqual(@as(usize, 5), try stringBytes(value));
 }
 
 test "empty strings round trip" {
@@ -247,18 +274,17 @@ test "empty strings round trip" {
         try encode(value, &writer);
 
         var reader: std.Io.Reader = .fixed(writer.buffered());
-        var strings: [0]u8 = .{};
-        const decoded = try decode(&reader, &strings);
-        try std.testing.expectEqual(@as(usize, 0), decoded.string_bytes);
-        try std.testing.expectEqualStrings("", decoded.value.uri);
+        const decoded = try decode(&reader, std.testing.allocator);
+        defer decoded.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("", decoded.uri);
         switch (value.id) {
             .implicit => |id| try std.testing.expectEqual(
                 id,
-                decoded.value.id.implicit,
+                decoded.id.implicit,
             ),
             .explicit => |id| try std.testing.expectEqualStrings(
                 id,
-                decoded.value.id.explicit,
+                decoded.id.explicit,
             ),
         }
     }
@@ -272,65 +298,57 @@ test "decode with a one-byte reader buffer" {
     var read_buf: [1]u8 = undefined;
     var limited = source.limited(.unlimited, &read_buf);
 
-    var implicit_strings: [3]u8 = undefined;
-    const implicit = try decode(&limited.interface, &implicit_strings);
-    try std.testing.expectEqual(@as(usize, 3), implicit.string_bytes);
-    try std.testing.expectEqualStrings("uri", implicit.value.uri);
+    const implicit = try decode(&limited.interface, std.testing.allocator);
+    defer implicit.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("uri", implicit.uri);
     try std.testing.expectEqual(
         @as(u32, 0x01020304),
-        implicit.value.id.implicit,
+        implicit.id.implicit,
     );
 
-    var explicit_strings: [5]u8 = undefined;
-    const explicit = try decode(&limited.interface, &explicit_strings);
-    try std.testing.expectEqual(@as(usize, 5), explicit.string_bytes);
-    try std.testing.expectEqualStrings("id", explicit.value.id.explicit);
-    try std.testing.expectEqualStrings("uri", explicit.value.uri);
+    const explicit = try decode(&limited.interface, std.testing.allocator);
+    defer explicit.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("id", explicit.id.explicit);
+    try std.testing.expectEqualStrings("uri", explicit.uri);
 }
 
 test "reject invalid kinds" {
     inline for (.{ 0, 3, std.math.maxInt(u8) }) |kind| {
         var fixture: [1]u8 = .{kind};
         var reader: std.Io.Reader = .fixed(&fixture);
-        var strings: [0]u8 = .{};
         try std.testing.expectError(
             error.InvalidKind,
-            decode(&reader, &strings),
+            decode(&reader, std.testing.allocator),
         );
     }
 }
 
-test "reject insufficient string storage" {
+test "decode allocation failure" {
     {
         var reader: std.Io.Reader = .fixed(
             "\x01\x04\x03\x02\x01\x03\x00\x00\x00uri",
         );
-        var strings: [2]u8 = undefined;
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = 0 },
+        );
         try std.testing.expectError(
-            error.BufferTooSmall,
-            decode(&reader, &strings),
+            error.OutOfMemory,
+            decode(&reader, failing.allocator()),
         );
     }
 
-    {
-        var reader: std.Io.Reader = .fixed(
-            "\x02\x03\x00\x00\x00id!\x03\x00\x00\x00uri",
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
         );
-        var strings: [2]u8 = undefined;
-        try std.testing.expectError(
-            error.BufferTooSmall,
-            decode(&reader, &strings),
-        );
-    }
-
-    {
         var reader: std.Io.Reader = .fixed(
             "\x02\x02\x00\x00\x00id\x03\x00\x00\x00uri",
         );
-        var strings: [4]u8 = undefined;
         try std.testing.expectError(
-            error.BufferTooSmall,
-            decode(&reader, &strings),
+            error.OutOfMemory,
+            decode(&reader, failing.allocator()),
         );
     }
 }
@@ -344,10 +362,9 @@ test "reject every truncation" {
     inline for (fixtures) |fixture| {
         for (0..fixture.len) |fixture_len| {
             var reader: std.Io.Reader = .fixed(fixture[0..fixture_len]);
-            var strings: [5]u8 = undefined;
             try std.testing.expectError(
                 error.EndOfStream,
-                decode(&reader, &strings),
+                decode(&reader, std.testing.allocator),
             );
         }
     }
