@@ -44,7 +44,12 @@
 //! CONTINUATION, READY, and FINISH.
 
 pub const envelope = @import("envelope.zig");
+pub const grid = @import("grid.zig");
 pub const hyperlink = @import("hyperlink.zig");
 pub const page = @import("page.zig");
 pub const record = @import("record.zig");
 pub const style = @import("style.zig");
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

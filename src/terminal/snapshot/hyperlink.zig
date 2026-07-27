@@ -64,6 +64,9 @@ pub const DecodePageError = std.Io.Reader.Error ||
     error{
         /// The hyperlink kind is not defined by snapshot version 0.
         InvalidKind,
+
+        /// The hyperlink value already exists in the page.
+        DuplicateHyperlink,
     };
 
 /// Encode one hyperlink entry.
@@ -136,7 +139,7 @@ pub fn decode(
 ///
 /// Explicit ID and URI bytes are read into the page string allocator and the
 /// completed entry is inserted into the page hyperlink set. The returned ID is
-/// the native page ID assigned to the entry.
+/// the native ID assigned by the destination page.
 pub fn decodePage(
     page: *terminal_page.Page,
     reader: *std.Io.Reader,
@@ -188,6 +191,14 @@ pub fn decodePage(
     };
     errdefer entry.free(page);
 
+    if (page.hyperlink_set.lookupContext(
+        page.memory,
+        entry,
+        .{ .page = page },
+    ) != null) {
+        return error.DuplicateHyperlink;
+    }
+
     return page.hyperlink_set.addContext(
         page.memory,
         entry,
@@ -219,7 +230,7 @@ fn decodePageString(
         .offset = terminal_size.getOffset(
             u8,
             page.memory,
-            value.ptr,
+            &value[0],
         ),
     };
 }
