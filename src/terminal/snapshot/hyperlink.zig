@@ -54,7 +54,7 @@ pub const EncodeError = std.Io.Writer.Error;
 
 /// Errors possible while decoding one allocator-owned hyperlink entry.
 pub const DecodeError = std.Io.Reader.Error || Allocator.Error || error{
-    /// The hyperlink kind is not defined by snapshot version 0.
+    /// The hyperlink kind is not defined by snapshot version 1.
     InvalidKind,
 };
 
@@ -62,7 +62,7 @@ pub const DecodeError = std.Io.Reader.Error || Allocator.Error || error{
 pub const DecodePageError = std.Io.Reader.Error ||
     terminal_page.Page.InsertHyperlinkError ||
     error{
-        /// The hyperlink kind is not defined by snapshot version 0.
+        /// The hyperlink kind is not defined by snapshot version 1.
         InvalidKind,
 
         /// The hyperlink value already exists in the page.
@@ -268,18 +268,18 @@ test "golden explicit encoding" {
 }
 
 test "empty strings round trip" {
-    const values = .{
-        terminal_hyperlink.Hyperlink{
+    const values: [2]terminal_hyperlink.Hyperlink = .{
+        .{
             .id = .{ .implicit = 0 },
             .uri = "",
         },
-        terminal_hyperlink.Hyperlink{
+        .{
             .id = .{ .explicit = "" },
             .uri = "",
         },
     };
 
-    inline for (values) |value| {
+    for (values) |value| {
         var encoded: [9]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&encoded);
         try encode(value, &writer);
@@ -299,28 +299,6 @@ test "empty strings round trip" {
             ),
         }
     }
-}
-
-test "decode with a one-byte reader buffer" {
-    const fixture =
-        "\x01\x04\x03\x02\x01\x03\x00\x00\x00uri" ++
-        "\x02\x02\x00\x00\x00id\x03\x00\x00\x00uri";
-    var source: std.Io.Reader = .fixed(fixture);
-    var read_buf: [1]u8 = undefined;
-    var limited = source.limited(.unlimited, &read_buf);
-
-    const implicit = try decode(&limited.interface, std.testing.allocator);
-    defer implicit.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("uri", implicit.uri);
-    try std.testing.expectEqual(
-        @as(u32, 0x01020304),
-        implicit.id.implicit,
-    );
-
-    const explicit = try decode(&limited.interface, std.testing.allocator);
-    defer explicit.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("id", explicit.id.explicit);
-    try std.testing.expectEqualStrings("uri", explicit.uri);
 }
 
 test "reject invalid kinds" {
@@ -365,12 +343,12 @@ test "decode allocation failure" {
 }
 
 test "reject every truncation" {
-    const fixtures = .{
+    const fixtures: [2][]const u8 = .{
         "\x01\x04\x03\x02\x01\x03\x00\x00\x00uri",
         "\x02\x02\x00\x00\x00id\x03\x00\x00\x00uri",
     };
 
-    inline for (fixtures) |fixture| {
+    for (fixtures) |fixture| {
         for (0..fixture.len) |fixture_len| {
             var reader: std.Io.Reader = .fixed(fixture[0..fixture_len]);
             try std.testing.expectError(

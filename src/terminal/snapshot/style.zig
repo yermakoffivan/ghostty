@@ -43,7 +43,7 @@
 //! |         4 | Dotted  |
 //! |         5 | Dashed  |
 //!
-//! Underline values 6 and 7 are invalid in snapshot version 0.
+//! Underline values 6 and 7 are invalid in snapshot version 1.
 
 const std = @import("std");
 const io = @import("io.zig");
@@ -81,10 +81,10 @@ const ColorKind = enum(u8) {
 
 /// Errors possible while decoding one style entry.
 pub const DecodeError = std.Io.Reader.Error || error{
-    /// A color kind is not defined by snapshot version 0.
+    /// A color kind is not defined by snapshot version 1.
     InvalidColorKind,
 
-    /// The encoded underline kind is not defined by snapshot version 0.
+    /// The encoded underline kind is not defined by snapshot version 1.
     InvalidUnderline,
 
     /// One or more reserved style flag bits are set.
@@ -279,7 +279,7 @@ test "flag bit layout" {
     }
 }
 
-test "decode with a one-byte reader buffer" {
+test "decoding" {
     const fixture =
         "\x00\x00\x00\x00" ++
         "\x01\x7f\x00\x00" ++

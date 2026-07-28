@@ -38,7 +38,7 @@
 //! |     1 | Prompt              |
 //! |     2 | Prompt continuation |
 //!
-//! Value 3 is invalid in snapshot version 0.
+//! Value 3 is invalid in snapshot version 1.
 //!
 //! ## Cell
 //!
@@ -94,7 +94,7 @@
 //! |     1 | Input   |
 //! |     2 | Prompt  |
 //!
-//! Value 3 is invalid in snapshot version 0.
+//! Value 3 is invalid in snapshot version 1.
 //!
 //! Style and hyperlink ID zero mean no style and no hyperlink. Other IDs
 //! refer to entries in the containing record's separate style and hyperlink
@@ -122,20 +122,14 @@ const TerminalStyleId = terminal_style.Id;
 /// Build this by inserting each decoded style into the page, then recording
 /// the encoded ID and the ID returned by the page's style set. Style ID zero is
 /// implicit and does not need an entry.
-pub const StyleRemap = std.AutoHashMap(
-    TerminalStyleId,
-    TerminalStyleId,
-);
+pub const StyleRemap = std.AutoHashMap(TerminalStyleId, TerminalStyleId);
 
 /// Maps encoded hyperlink table IDs to IDs assigned by the destination page.
 ///
 /// Build this by inserting each decoded hyperlink into the page, then
 /// recording the encoded ID and the ID returned by the page's hyperlink set.
 /// Hyperlink ID zero is implicit and does not need an entry.
-pub const HyperlinkRemap = std.AutoHashMap(
-    TerminalHyperlinkId,
-    TerminalHyperlinkId,
-);
+pub const HyperlinkRemap = std.AutoHashMap(TerminalHyperlinkId, TerminalHyperlinkId);
 
 pub const EncodeError = std.Io.Writer.Error;
 
@@ -306,7 +300,11 @@ pub fn decode(
                 .codepoint => {
                     const cp = std.math.cast(u21, header.value.codepoint) orelse
                         return error.InvalidCodepoint;
-                    if (!validCodepoint(cp)) return error.InvalidCodepoint;
+                    if (cp > 0x10FFFF or
+                        (cp >= 0xD800 and cp <= 0xDFFF))
+                    {
+                        return error.InvalidCodepoint;
+                    }
                     if (cp == kitty.graphics.unicode.placeholder) {
                         return error.UnsupportedKittyGraphics;
                     }
@@ -367,7 +365,11 @@ pub fn decode(
                 const suffix_raw = try io.readInt(reader, u32);
                 const suffix = std.math.cast(u21, suffix_raw) orelse
                     return error.InvalidCodepoint;
-                if (!validCodepoint(suffix)) return error.InvalidCodepoint;
+                if (suffix > 0x10FFFF or
+                    (suffix >= 0xD800 and suffix <= 0xDFFF))
+                {
+                    return error.InvalidCodepoint;
+                }
                 if (suffix == kitty.graphics.unicode.placeholder) {
                     return error.UnsupportedKittyGraphics;
                 }
@@ -406,7 +408,7 @@ const RowHeader = packed struct(u8) {
 };
 
 /// The fixed fields that precede a cell's grapheme suffix codepoints.
-pub const CellHeader = struct {
+const CellHeader = struct {
     /// Number of bytes written by `encode`, calculated using the encoder itself
     /// so this remains synchronized with the field-by-field wire format.
     pub const len = computeLen();
@@ -556,7 +558,3 @@ pub const CellHeader = struct {
         };
     };
 };
-
-fn validCodepoint(cp: u21) bool {
-    return cp <= 0x10FFFF and (cp < 0xD800 or cp > 0xDFFF);
-}

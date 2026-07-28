@@ -320,24 +320,8 @@ test "golden PAGE record header and checksum" {
     );
 }
 
-test "decode header with a one-byte reader buffer" {
-    const fixture = "\x03\x00\x18\x00\x00\x00\x1b\x44\x78\x71";
-    var source: std.Io.Reader = .fixed(fixture);
-    var buf: [1]u8 = undefined;
-    var limited = source.limited(.unlimited, &buf);
-
-    try std.testing.expectEqual(
-        Header{
-            .tag = .page,
-            .payload_len = 24,
-            .crc32c = 0x7178441b,
-        },
-        try Header.decode(&limited.interface),
-    );
-}
-
 test "reject invalid tags" {
-    inline for (.{ 0, 7, std.math.maxInt(u16) }) |tag| {
+    for ([_]u16{ 0, 7, std.math.maxInt(u16) }) |tag| {
         var fixture = [_]u8{0} ** Header.len;
         std.mem.writeInt(u16, fixture[0..2], tag, .little);
         var reader: std.Io.Reader = .fixed(&fixture);

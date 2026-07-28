@@ -15,7 +15,7 @@
 //!
 //! ## Snapshot Format
 //!
-//! This documents snapshot format 0. Version 0 is the work-in-progress
+//! This documents snapshot format 1. Version 1 is the work-in-progress
 //! format that we intended to continue to break until we can promise
 //! binary compatibility.
 //!

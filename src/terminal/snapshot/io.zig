@@ -38,6 +38,8 @@ test "integer round trip with a one-byte reader buffer" {
     try writeInt(&writer, u16, 0x1234);
     try writeInt(&writer, u32, 0x56789abc);
 
+    // Keep the reader buffer smaller than either integer to verify readInt
+    // does not inherit std.Io.Reader.takeInt's buffer-size requirement.
     var source: std.Io.Reader = .fixed(&encoded);
     var buf: [1]u8 = undefined;
     var limited = source.limited(.unlimited, &buf);

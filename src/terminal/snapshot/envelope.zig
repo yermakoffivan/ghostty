@@ -13,22 +13,22 @@
 //!
 //! | Offset | Size | Field                |
 //! | -----: | ---: | :------------------- |
-//! |      0 |    8 | Magic (`BOOSNAP\0`)  |
+//! |      0 |    8 | Magic (`GHOSTSNP`)   |
 //! |      8 |    2 | Version (`u16`)      |
 
 const std = @import("std");
 const io = @import("io.zig");
 
 /// Identifies a Ghostty terminal snapshot and rejects unrelated input before
-/// any record decoding begins. The trailing NUL is part of the wire value.
-pub const magic = "BOOSNAP\x00";
+/// any record decoding begins. All eight bytes are part of the wire value.
+pub const magic = "GHOSTSNP";
 
 /// The complete compatibility boundary for snapshot layout and behavior.
-/// Version 0 readers require this value to match exactly.
-pub const version: u16 = 0;
+/// Version 1 readers require this value to match exactly.
+pub const version: u16 = 1;
 
 /// Number of bytes in the fixed envelope: magic followed by version.
-pub const encoded_len = magic.len + @sizeOf(@TypeOf(version));
+pub const encoded_len = computeLen();
 
 comptime {
     // We expect this so if it changes we should think carefully.
@@ -56,22 +56,31 @@ pub fn decode(reader: *std.Io.Reader) DecodeError!void {
     if (actual_version != version) return error.UnsupportedVersion;
 }
 
+fn computeLen() usize {
+    comptime {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        encode(&writer) catch unreachable;
+        return writer.end;
+    }
+}
+
 test "golden encoding" {
     var buf: [encoded_len]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try encode(&writer);
 
     try std.testing.expectEqualStrings(
-        "BOOSNAP\x00\x00\x00",
+        "GHOSTSNP\x01\x00",
         writer.buffered(),
     );
 }
 
 test "reject invalid magic and version" {
-    var invalid_magic: std.Io.Reader = .fixed("BOOSNAX\x00\x00\x00");
+    var invalid_magic: std.Io.Reader = .fixed("GHOSTSNX\x01\x00");
     try std.testing.expectError(error.InvalidMagic, decode(&invalid_magic));
 
-    var invalid_version: std.Io.Reader = .fixed("BOOSNAP\x00\x01\x00");
+    var invalid_version: std.Io.Reader = .fixed("GHOSTSNP\x00\x00");
     try std.testing.expectError(
         error.UnsupportedVersion,
         decode(&invalid_version),
@@ -79,7 +88,7 @@ test "reject invalid magic and version" {
 }
 
 test "reject every truncation" {
-    const fixture = "BOOSNAP\x00\x00\x00";
+    const fixture = "GHOSTSNP\x01\x00";
     for (0..encoded_len) |len| {
         var reader: std.Io.Reader = .fixed(fixture[0..len]);
         try std.testing.expectError(error.EndOfStream, decode(&reader));

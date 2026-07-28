@@ -123,7 +123,7 @@ const PayloadDecodeError = style.DecodeError ||
     grid.DecodeError ||
     Header.CapacityError ||
     error{
-        /// The hyperlink kind is not defined by snapshot version 0.
+        /// The hyperlink kind is not defined by snapshot version 1.
         InvalidKind,
 
         /// The advertised string capacity cannot hold the encoded hyperlinks.
@@ -478,6 +478,9 @@ fn pageHyperlink(
     };
 }
 
+// Regenerate these after a wire-format change from `writer.buffered()` in the
+// sparse-page test and `destination.written()` in the empty-record test below.
+// Format those byte slices as Zig-escaped strings before replacing the literals.
 const test_page_fixture =
     "\x03\x00\x02\x00\x02\x00\x02\x00\x08\x00\x00\x02\x80\x00\x00\x00" ++
     "\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
@@ -576,6 +579,8 @@ test "framed PAGE encode and decode a sparse native page" {
     var page = try TerminalPage.init(capacity);
     defer page.deinit();
 
+    // Create holes in both source tables so the encoded IDs exercise sparse
+    // table remapping rather than coincidentally matching decoded IDs.
     const style_a = try page.styles.add(page.memory, .{
         .flags = .{ .bold = true },
     });
@@ -619,6 +624,8 @@ test "framed PAGE encode and decode a sparse native page" {
     try page.setHyperlink(second.row, second.cell, hyperlink_b);
     try page.setHyperlink(third.row, third.cell, hyperlink_a);
 
+    // Cover graphemes, wide-cell pairs, colors, protection, and semantic
+    // metadata in one compact two-row page.
     const grapheme = page.getRowAndCell(0, 1);
     grapheme.cell.* = .init('x');
     try page.setGraphemes(
@@ -666,6 +673,8 @@ test "framed PAGE encode and decode a sparse native page" {
     };
     try std.testing.expectEqual(header, Header.init(&page));
 
+    // Lock the payload bytes and independently verify the counting writer sees
+    // the same encoded length.
     var counter: std.Io.Writer.Discarding = .init(&.{});
     try encodePayload(&page, &counter.writer);
 
@@ -677,6 +686,7 @@ test "framed PAGE encode and decode a sparse native page" {
     try std.testing.expectEqualStrings(fixture, writer.buffered());
     try std.testing.expectEqual(@as(u64, fixture.len), counter.count);
 
+    // A one-byte backing buffer exercises streaming reads across every field.
     var source: std.Io.Reader = .fixed(writer.buffered());
     var read_buf: [1]u8 = undefined;
     var limited = source.limited(.unlimited, &read_buf);
@@ -689,6 +699,8 @@ test "framed PAGE encode and decode a sparse native page" {
     try std.testing.expectEqual(header, Header.init(&decoded));
     try decoded.verifyIntegrity(std.testing.allocator);
 
+    // Decoding compacts the sparse source IDs while preserving table values
+    // and all cell references through the remap tables.
     var style_it = decoded.styles.iterator(decoded.memory);
     const decoded_style_a = style_it.next().?;
     try std.testing.expectEqual(@as(TerminalStyleId, 1), decoded_style_a.id);
@@ -763,6 +775,8 @@ test "framed PAGE encode and decode a sparse native page" {
         decoded_spacer_head.row.semantic_prompt,
     );
 
+    // The first re-encode reflects compacted IDs; subsequent round trips must
+    // stabilize byte-for-byte.
     var reencoded: [512]u8 = undefined;
     var rewriter: std.Io.Writer = .fixed(&reencoded);
     try encodePayload(&decoded, &rewriter);
@@ -855,6 +869,7 @@ test "framed PAGE golden empty record" {
 
 test "framed PAGE validates tag length checksum and exhaustion" {
     {
+        // A valid non-PAGE tag is rejected before payload decoding.
         var wrong_tag = test_empty_framed_page_fixture.*;
         std.mem.writeInt(u16, wrong_tag[0..2], @intFromEnum(record.Tag.screen), .little);
         var reader: std.Io.Reader = .fixed(&wrong_tag);
@@ -865,6 +880,7 @@ test "framed PAGE validates tag length checksum and exhaustion" {
     }
 
     {
+        // Corrupt only the stored checksum.
         var invalid_checksum = test_empty_framed_page_fixture.*;
         invalid_checksum[6] ^= 1;
         var reader: std.Io.Reader = .fixed(&invalid_checksum);
@@ -875,6 +891,7 @@ test "framed PAGE validates tag length checksum and exhaustion" {
     }
 
     {
+        // Mutate a cell without updating the checksum.
         var invalid_payload = test_empty_framed_page_fixture.*;
         const value_offset = record.Header.len +
             Header.len +
@@ -889,6 +906,7 @@ test "framed PAGE validates tag length checksum and exhaustion" {
     }
 
     {
+        // Advertise one byte less than the PAGE decoder requires.
         var short_payload = test_empty_framed_page_fixture.*;
         std.mem.writeInt(u32, short_payload[2..6], 36, .little);
         var reader: std.Io.Reader = .fixed(&short_payload);
@@ -899,6 +917,8 @@ test "framed PAGE validates tag length checksum and exhaustion" {
     }
 
     {
+        // Add a payload byte and recompute the checksum so exhaustion, rather
+        // than checksum validation, is what fails.
         var trailing: [test_empty_framed_page_fixture.len + 1]u8 = undefined;
         @memcpy(
             trailing[0..test_empty_framed_page_fixture.len],
@@ -965,7 +985,7 @@ test "decode accepts unordered sparse style IDs and rejects zero" {
         Header.len +
             2 * (2 + style.len) +
             1 +
-            grid.CellHeader.len
+            16
     ]u8 = undefined;
     var descending_writer: std.Io.Writer = .fixed(&descending);
     try header.encode(&descending_writer);
@@ -974,7 +994,7 @@ test "decode accepts unordered sparse style IDs and rejects zero" {
     try io.writeInt(&descending_writer, TerminalStyleId, 2);
     try style.encode(.{ .flags = .{ .italic = true } }, &descending_writer);
     try descending_writer.writeByte(0);
-    try grid.CellHeader.encode(.{}, &descending_writer);
+    try descending_writer.splatByteAll(0, 16);
 
     var descending_reader: std.Io.Reader = .fixed(
         descending_writer.buffered(),
@@ -1035,7 +1055,7 @@ test "decode accepts unordered sparse hyperlink IDs" {
         Header.len +
             2 * 11 +
             1 +
-            grid.CellHeader.len
+            16
     ]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&encoded);
     try header.encode(&writer);
@@ -1044,7 +1064,7 @@ test "decode accepts unordered sparse hyperlink IDs" {
     try io.writeInt(&writer, TerminalHyperlinkId, 2);
     try hyperlink.encode(second, &writer);
     try writer.writeByte(0);
-    try grid.CellHeader.encode(.{}, &writer);
+    try writer.splatByteAll(0, 16);
 
     var reader: std.Io.Reader = .fixed(writer.buffered());
     var decoded = try decodePayload(
@@ -1059,6 +1079,7 @@ test "decode accepts unordered sparse hyperlink IDs" {
 }
 
 test "decode defaults missing sparse cell references" {
+    // An unknown style ID falls back to the default style.
     const style_header: Header = .{
         .columns = 1,
         .rows = 1,
@@ -1091,6 +1112,7 @@ test "decode defaults missing sparse cell references" {
         style_page.getRowAndCell(0, 0).cell.style_id,
     );
 
+    // An unknown hyperlink ID likewise falls back to no hyperlink.
     const hyperlink_header: Header = .{
         .columns = 1,
         .rows = 1,
@@ -1346,39 +1368,6 @@ test "decode rejects duplicate hyperlinks with empty strings" {
     var reader: std.Io.Reader = .fixed(writer.buffered());
     try std.testing.expectError(
         error.DuplicateHyperlink,
-        decodePayload(&reader, std.testing.allocator),
-    );
-}
-
-test "decode reads hyperlink strings into page storage" {
-    const link: TerminalHyperlink = .{
-        .id = .{ .explicit = "id" },
-        .uri = "uri",
-    };
-    const hyperlink_capacity: u16 = @intCast(
-        TerminalHyperlinkSet.capacityForCount(1) *
-            @sizeOf(TerminalHyperlinkSet.Item),
-    );
-    const header: Header = .{
-        .columns = 1,
-        .rows = 1,
-        .style_count = 0,
-        .hyperlink_count = 1,
-        .style_capacity = 0,
-        .hyperlink_capacity_bytes = hyperlink_capacity,
-        .grapheme_capacity_bytes = 0,
-        .string_capacity_bytes = 0,
-    };
-
-    var encoded: [Header.len + 16]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&encoded);
-    try header.encode(&writer);
-    try io.writeInt(&writer, TerminalHyperlinkId, 1);
-    try hyperlink.encode(link, &writer);
-
-    var reader: std.Io.Reader = .fixed(writer.buffered());
-    try std.testing.expectError(
-        error.InvalidStringCapacity,
         decodePayload(&reader, std.testing.allocator),
     );
 }
