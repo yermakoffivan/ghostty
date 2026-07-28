@@ -42,6 +42,30 @@
 //! Records have a strict order: TERMINAL, the primary SCREEN and its
 //! PAGE records, an optional alternate SCREEN and its PAGE records,
 //! CONTINUATION, READY, and FINISH.
+//!
+//! ## Encoding
+//!
+//! Encode the envelope once, then append records in the required order:
+//!
+//! ```zig
+//! var output: std.Io.Writer.Allocating = .init(alloc);
+//! defer output.deinit();
+//!
+//! try envelope.encode(&output.writer);
+//! try page.encode(&terminal_page, &output);
+//!
+//! const snapshot = output.written();
+//! ```
+//!
+//! Record codecs reserve and backpatch their own framing, so callers do not
+//! calculate payload lengths or checksums. `written` borrows the completed
+//! bytes from the allocating writer. Use `toOwnedSlice` instead when ownership
+//! must be transferred to the caller.
+//!
+//! `page.encode` currently appends one complete framed PAGE record. Its
+//! lower-level payload codec is intentionally private. `page.decode` consumes
+//! and validates one complete PAGE record, including its payload boundary,
+//! checksum, and restored page integrity.
 
 pub const envelope = @import("envelope.zig");
 pub const grid = @import("grid.zig");

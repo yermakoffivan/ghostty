@@ -94,9 +94,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const envelope = @import("envelope.zig");
 const grid = @import("grid.zig");
 const hyperlink = @import("hyperlink.zig");
 const io = @import("io.zig");
+const record = @import("record.zig");
 const style = @import("style.zig");
 const terminal_hyperlink = @import("../hyperlink.zig");
 const terminal_page = @import("../page.zig");
@@ -115,11 +117,9 @@ const TerminalStyle = terminal_style.Style;
 const TerminalStyleId = terminal_style.Id;
 const TerminalStyleSet = terminal_style.Set;
 
-/// Errors possible while encoding a native PAGE.
-pub const EncodeError = hyperlink.EncodeError || grid.EncodeError;
+const PayloadEncodeError = hyperlink.EncodeError || grid.EncodeError;
 
-/// Errors possible while decoding a native PAGE.
-pub const DecodeError = style.DecodeError ||
+const PayloadDecodeError = style.DecodeError ||
     grid.DecodeError ||
     Header.CapacityError ||
     error{
@@ -146,11 +146,59 @@ pub const DecodeError = style.DecodeError ||
         OutOfMemory,
     };
 
-/// Encode a complete PAGE directly from a native page.
+/// Errors possible while encoding a complete PAGE record.
+pub const EncodeError = PayloadEncodeError || record.Writer.FinishError;
+
+/// Encode one complete PAGE record from a native page.
+///
+/// The record is appended to `destination`. Its header is reserved before the
+/// payload is encoded, then backpatched with the payload length and CRC32C. If
+/// encoding fails, the partial record is removed while earlier bytes remain.
 pub fn encode(
     page: *const TerminalPage,
-    writer: *std.Io.Writer,
+    destination: *std.Io.Writer.Allocating,
 ) EncodeError!void {
+    var record_writer = try record.Writer.init(destination, .page);
+    errdefer record_writer.cancel();
+    try encodePayload(page, record_writer.payloadWriter());
+    try record_writer.finish();
+}
+
+/// Errors possible while decoding and validating a complete PAGE record.
+pub const DecodeError = PayloadDecodeError ||
+    record.Reader.InitError ||
+    record.Reader.FinishError ||
+    TerminalPage.IntegrityError ||
+    error{
+        /// The next record is valid but is not a PAGE.
+        UnexpectedRecordTag,
+    };
+
+/// Decode and validate one complete PAGE record into a fresh native page.
+///
+/// The record tag, payload boundary, CRC32C, payload contents, and final page
+/// integrity are all validated before the page is returned. `alloc` is used
+/// only for temporary decode remaps and integrity-check storage.
+pub fn decode(
+    reader: *std.Io.Reader,
+    alloc: Allocator,
+) DecodeError!TerminalPage {
+    var record_reader: record.Reader = undefined;
+    try record_reader.init(reader);
+    if (record_reader.header.tag != .page) return error.UnexpectedRecordTag;
+
+    var page = try decodePayload(record_reader.payloadReader(), alloc);
+    errdefer page.deinit();
+    try record_reader.finish();
+    try page.verifyIntegrity(alloc);
+    return page;
+}
+
+/// Encode a PAGE payload directly from a native page.
+fn encodePayload(
+    page: *const TerminalPage,
+    writer: *std.Io.Writer,
+) PayloadEncodeError!void {
     // Write header
     try Header.init(page).encode(writer);
 
@@ -172,14 +220,14 @@ pub fn encode(
     try grid.encode(page, writer);
 }
 
-/// Decode a complete PAGE directly into a fresh native page.
+/// Decode a PAGE payload directly into a fresh native page.
 ///
 /// `alloc` is used only for the temporary native-ID remap tables. Styles,
 /// hyperlinks, strings, graphemes, rows, and cells are stored in the page.
-pub fn decode(
+fn decodePayload(
     reader: *std.Io.Reader,
     alloc: Allocator,
-) DecodeError!TerminalPage {
+) PayloadDecodeError!TerminalPage {
     // Decode the header, validate capacities, init page
     const header = try Header.decode(reader);
     const capacity = try header.pageCapacity();
@@ -445,6 +493,18 @@ const test_page_fixture =
     "\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
     "\x00\x00";
 
+const test_empty_framed_page_fixture =
+    // Record header: PAGE, 37-byte payload, CRC32C.
+    "\x03\x00\x25\x00\x00\x00\x8c\x05\xd6\xd3" ++
+    // PAGE header: one column, one row, and zero counts/capacities.
+    "\x01\x00\x01\x00\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x00" ++
+    // One default row and one empty cell.
+    "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x00";
+
 test "golden encoding" {
     const header: Header = .{
         .columns = 0x0102,
@@ -504,7 +564,7 @@ test "reject every truncation" {
     }
 }
 
-test "encode and decode a sparse native page" {
+test "framed PAGE encode and decode a sparse native page" {
     const capacity: TerminalPageCapacity = .{
         .cols = 3,
         .rows = 2,
@@ -607,11 +667,11 @@ test "encode and decode a sparse native page" {
     try std.testing.expectEqual(header, Header.init(&page));
 
     var counter: std.Io.Writer.Discarding = .init(&.{});
-    try encode(&page, &counter.writer);
+    try encodePayload(&page, &counter.writer);
 
     var encoded: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&encoded);
-    try encode(&page, &writer);
+    try encodePayload(&page, &writer);
 
     const fixture = test_page_fixture;
     try std.testing.expectEqualStrings(fixture, writer.buffered());
@@ -620,7 +680,10 @@ test "encode and decode a sparse native page" {
     var source: std.Io.Reader = .fixed(writer.buffered());
     var read_buf: [1]u8 = undefined;
     var limited = source.limited(.unlimited, &read_buf);
-    var decoded = try decode(&limited.interface, std.testing.allocator);
+    var decoded = try decodePayload(
+        &limited.interface,
+        std.testing.allocator,
+    );
     defer decoded.deinit();
 
     try std.testing.expectEqual(header, Header.init(&decoded));
@@ -702,7 +765,7 @@ test "encode and decode a sparse native page" {
 
     var reencoded: [512]u8 = undefined;
     var rewriter: std.Io.Writer = .fixed(&reencoded);
-    try encode(&decoded, &rewriter);
+    try encodePayload(&decoded, &rewriter);
     try std.testing.expect(!std.mem.eql(
         u8,
         writer.buffered(),
@@ -710,7 +773,7 @@ test "encode and decode a sparse native page" {
     ));
 
     var reencoded_reader: std.Io.Reader = .fixed(rewriter.buffered());
-    var decoded_again = try decode(
+    var decoded_again = try decodePayload(
         &reencoded_reader,
         std.testing.allocator,
     );
@@ -719,11 +782,161 @@ test "encode and decode a sparse native page" {
 
     var reencoded_again: [512]u8 = undefined;
     var rewriter_again: std.Io.Writer = .fixed(&reencoded_again);
-    try encode(&decoded_again, &rewriter_again);
+    try encodePayload(&decoded_again, &rewriter_again);
     try std.testing.expectEqualStrings(
         rewriter.buffered(),
         rewriter_again.buffered(),
     );
+
+    // The public codec appends one complete PAGE record after the envelope.
+    var snapshot: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer snapshot.deinit();
+    try envelope.encode(&snapshot.writer);
+    try encode(&page, &snapshot);
+
+    const snapshot_bytes = snapshot.written();
+    try std.testing.expectEqualStrings(
+        test_page_fixture,
+        snapshot_bytes[envelope.encoded_len + record.Header.len ..],
+    );
+
+    var snapshot_reader: std.Io.Reader = .fixed(snapshot_bytes);
+    try envelope.decode(&snapshot_reader);
+    var framed_page = try decode(
+        &snapshot_reader,
+        std.testing.allocator,
+    );
+    defer framed_page.deinit();
+
+    try std.testing.expectEqual(header, Header.init(&framed_page));
+    const framed_first = framed_page.getRowAndCell(0, 0);
+    try std.testing.expectEqual(@as(u21, 'A'), framed_first.cell.codepoint());
+    try std.testing.expectEqual(
+        TerminalCell.SemanticContent.prompt,
+        framed_first.cell.semantic_content,
+    );
+    try std.testing.expectEqualSlices(
+        u21,
+        &.{ 0x0301, 0x0302 },
+        framed_page.lookupGrapheme(
+            framed_page.getRowAndCell(0, 1).cell,
+        ).?,
+    );
+}
+
+test "framed PAGE golden empty record" {
+    const capacity: TerminalPageCapacity = .{
+        .cols = 1,
+        .rows = 1,
+        .styles = 0,
+        .hyperlink_bytes = 0,
+        .grapheme_bytes = 0,
+        .string_bytes = 0,
+    };
+    var page = try TerminalPage.init(capacity);
+    defer page.deinit();
+
+    var destination: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer destination.deinit();
+    try encode(&page, &destination);
+    try std.testing.expectEqualStrings(
+        test_empty_framed_page_fixture,
+        destination.written(),
+    );
+
+    var source: std.Io.Reader = .fixed(destination.written());
+    var decoded = try decode(&source, std.testing.allocator);
+    defer decoded.deinit();
+    try std.testing.expectEqual(
+        Header.init(&page),
+        Header.init(&decoded),
+    );
+}
+
+test "framed PAGE validates tag length checksum and exhaustion" {
+    {
+        var wrong_tag = test_empty_framed_page_fixture.*;
+        std.mem.writeInt(u16, wrong_tag[0..2], @intFromEnum(record.Tag.screen), .little);
+        var reader: std.Io.Reader = .fixed(&wrong_tag);
+        try std.testing.expectError(
+            error.UnexpectedRecordTag,
+            decode(&reader, std.testing.allocator),
+        );
+    }
+
+    {
+        var invalid_checksum = test_empty_framed_page_fixture.*;
+        invalid_checksum[6] ^= 1;
+        var reader: std.Io.Reader = .fixed(&invalid_checksum);
+        try std.testing.expectError(
+            error.InvalidChecksum,
+            decode(&reader, std.testing.allocator),
+        );
+    }
+
+    {
+        var invalid_payload = test_empty_framed_page_fixture.*;
+        const value_offset = record.Header.len +
+            Header.len +
+            1 +
+            8;
+        invalid_payload[value_offset] = 'A';
+        var reader: std.Io.Reader = .fixed(&invalid_payload);
+        try std.testing.expectError(
+            error.InvalidChecksum,
+            decode(&reader, std.testing.allocator),
+        );
+    }
+
+    {
+        var short_payload = test_empty_framed_page_fixture.*;
+        std.mem.writeInt(u32, short_payload[2..6], 36, .little);
+        var reader: std.Io.Reader = .fixed(&short_payload);
+        try std.testing.expectError(
+            error.EndOfStream,
+            decode(&reader, std.testing.allocator),
+        );
+    }
+
+    {
+        var trailing: [test_empty_framed_page_fixture.len + 1]u8 = undefined;
+        @memcpy(
+            trailing[0..test_empty_framed_page_fixture.len],
+            test_empty_framed_page_fixture,
+        );
+        trailing[trailing.len - 1] = 0;
+        std.mem.writeInt(u32, trailing[2..6], 38, .little);
+
+        var checksum: record.Checksum = .init(.page, 38);
+        try checksum.writer().writeAll(trailing[record.Header.len..]);
+        std.mem.writeInt(u32, trailing[6..10], checksum.final(), .little);
+
+        var reader: std.Io.Reader = .fixed(&trailing);
+        try std.testing.expectError(
+            error.PayloadNotExhausted,
+            decode(&reader, std.testing.allocator),
+        );
+    }
+}
+
+test "framed PAGE rejects every truncation and preserves following bytes" {
+    for (0..test_empty_framed_page_fixture.len) |len| {
+        var reader: std.Io.Reader = .fixed(
+            test_empty_framed_page_fixture[0..len],
+        );
+        if (decode(&reader, std.testing.allocator)) |decoded_value| {
+            var unexpected = decoded_value;
+            unexpected.deinit();
+            return error.ExpectedDecodeFailure;
+        } else |_| {}
+    }
+
+    var source: std.Io.Reader = .fixed(
+        test_empty_framed_page_fixture ++ "next",
+    );
+    var decoded = try decode(&source, std.testing.allocator);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("next", try source.take(4));
 }
 
 test "decode sparse page rejects every truncation" {
@@ -731,7 +944,7 @@ test "decode sparse page rejects every truncation" {
         var reader: std.Io.Reader = .fixed(test_page_fixture[0..len]);
         try std.testing.expectError(
             error.EndOfStream,
-            decode(&reader, std.testing.allocator),
+            decodePayload(&reader, std.testing.allocator),
         );
     }
 }
@@ -766,7 +979,7 @@ test "decode accepts unordered sparse style IDs and rejects zero" {
     var descending_reader: std.Io.Reader = .fixed(
         descending_writer.buffered(),
     );
-    var decoded_descending = try decode(
+    var decoded_descending = try decodePayload(
         &descending_reader,
         std.testing.allocator,
     );
@@ -793,7 +1006,7 @@ test "decode accepts unordered sparse style IDs and rejects zero" {
     var zero_reader: std.Io.Reader = .fixed(zero_writer.buffered());
     try std.testing.expectError(
         error.InvalidStyleId,
-        decode(&zero_reader, std.testing.allocator),
+        decodePayload(&zero_reader, std.testing.allocator),
     );
 }
 
@@ -834,7 +1047,7 @@ test "decode accepts unordered sparse hyperlink IDs" {
     try grid.CellHeader.encode(.{}, &writer);
 
     var reader: std.Io.Reader = .fixed(writer.buffered());
-    var decoded = try decode(
+    var decoded = try decodePayload(
         &reader,
         std.testing.allocator,
     );
@@ -868,7 +1081,7 @@ test "decode defaults missing sparse cell references" {
     try io.writeInt(&style_writer, u32, 0);
 
     var style_reader: std.Io.Reader = .fixed(style_writer.buffered());
-    var style_page = try decode(
+    var style_page = try decodePayload(
         &style_reader,
         std.testing.allocator,
     );
@@ -902,7 +1115,7 @@ test "decode defaults missing sparse cell references" {
     var hyperlink_reader: std.Io.Reader = .fixed(
         hyperlink_writer.buffered(),
     );
-    var hyperlink_page = try decode(
+    var hyperlink_page = try decodePayload(
         &hyperlink_reader,
         std.testing.allocator,
     );
@@ -935,7 +1148,7 @@ test "decode rejects undefined row and cell values" {
     var row_reader: std.Io.Reader = .fixed(row_writer.buffered());
     try std.testing.expectError(
         error.InvalidRow,
-        decode(&row_reader, std.testing.allocator),
+        decodePayload(&row_reader, std.testing.allocator),
     );
 
     var invalid_cell: [Header.len + 2]u8 = undefined;
@@ -947,7 +1160,7 @@ test "decode rejects undefined row and cell values" {
     var cell_reader: std.Io.Reader = .fixed(cell_writer.buffered());
     try std.testing.expectError(
         error.InvalidCell,
-        decode(&cell_reader, std.testing.allocator),
+        decodePayload(&cell_reader, std.testing.allocator),
     );
 
     var invalid_codepoint: [Header.len + 1 + 16]u8 = undefined;
@@ -965,7 +1178,7 @@ test "decode rejects undefined row and cell values" {
     );
     try std.testing.expectError(
         error.InvalidCodepoint,
-        decode(&codepoint_reader, std.testing.allocator),
+        decodePayload(&codepoint_reader, std.testing.allocator),
     );
 
     var invalid_color: [Header.len + 1 + 16]u8 = undefined;
@@ -981,7 +1194,7 @@ test "decode rejects undefined row and cell values" {
     var color_reader: std.Io.Reader = .fixed(color_writer.buffered());
     try std.testing.expectError(
         error.InvalidColor,
-        decode(&color_reader, std.testing.allocator),
+        decodePayload(&color_reader, std.testing.allocator),
     );
 }
 
@@ -1049,7 +1262,7 @@ test "decode validates dimensions and native table capacities" {
         var reader: std.Io.Reader = .fixed(writer.buffered());
         try std.testing.expectError(
             case.expected,
-            decode(&reader, std.testing.allocator),
+            decodePayload(&reader, std.testing.allocator),
         );
     }
 }
@@ -1080,7 +1293,7 @@ test "decode rejects duplicate and default style entries" {
     var reader: std.Io.Reader = .fixed(writer.buffered());
     try std.testing.expectError(
         error.DuplicateStyle,
-        decode(&reader, std.testing.allocator),
+        decodePayload(&reader, std.testing.allocator),
     );
 
     const default_header: Header = .{
@@ -1102,7 +1315,7 @@ test "decode rejects duplicate and default style entries" {
     var default_reader: std.Io.Reader = .fixed(default_writer.buffered());
     try std.testing.expectError(
         error.DefaultStyle,
-        decode(&default_reader, std.testing.allocator),
+        decodePayload(&default_reader, std.testing.allocator),
     );
 }
 
@@ -1133,7 +1346,7 @@ test "decode rejects duplicate hyperlinks with empty strings" {
     var reader: std.Io.Reader = .fixed(writer.buffered());
     try std.testing.expectError(
         error.DuplicateHyperlink,
-        decode(&reader, std.testing.allocator),
+        decodePayload(&reader, std.testing.allocator),
     );
 }
 
@@ -1166,6 +1379,6 @@ test "decode reads hyperlink strings into page storage" {
     var reader: std.Io.Reader = .fixed(writer.buffered());
     try std.testing.expectError(
         error.InvalidStringCapacity,
-        decode(&reader, std.testing.allocator),
+        decodePayload(&reader, std.testing.allocator),
     );
 }

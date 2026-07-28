@@ -141,24 +141,94 @@ pub const Checksum = struct {
     }
 };
 
-/// A checksum-verifying reader limited to one record payload.
+/// Builds one complete record.
 ///
-/// Initialize this only after decoding a `Header`, decode the payload through
-/// `reader`, and then call `finish`. The caller owns both buffers and chooses
-/// their sizes. They only need to remain valid until `finish` returns.
-pub const PayloadReader = struct {
+/// This Writer requires an Allocating std.Io.Writer because the record
+/// format requires reading the full payload and rewinding in order to
+/// write the length + CRC without encoding twice.
+pub const Writer = struct {
+    destination: *std.Io.Writer.Allocating,
+    tag: Tag,
+    record_start: usize,
+
+    /// Reserve space for a record at the current end of `destination`.
+    /// Once this is called, callers MUST NOT write anything else to
+    /// the writer until `finish` or `cancel` is called.
+    pub fn init(
+        destination: *std.Io.Writer.Allocating,
+        tag: Tag,
+    ) std.Io.Writer.Error!Writer {
+        const record_start = destination.written().len;
+        errdefer destination.shrinkRetainingCapacity(record_start);
+        try destination.writer.splatByteAll(0, Header.len);
+        return .{
+            .destination = destination,
+            .tag = tag,
+            .record_start = record_start,
+        };
+    }
+
+    /// Return the writer through which the payload is encoded exactly once.
+    pub fn payloadWriter(self: *Writer) *std.Io.Writer {
+        return &self.destination.writer;
+    }
+
+    pub const FinishError = error{
+        /// The payload cannot be represented by the record's `u32` length.
+        PayloadTooLarge,
+    };
+
+    /// Marked the completed record with the payload length and CRC32C.
+    pub fn finish(self: *Writer) FinishError!void {
+        const bytes = self.destination.written();
+        const payload_start = self.record_start + Header.len;
+        const payload_len = std.math.cast(
+            u32,
+            bytes.len - payload_start,
+        ) orelse return error.PayloadTooLarge;
+        const payload = bytes[payload_start..];
+
+        // Calculate our CRC
+        var checksum: Checksum = .init(self.tag, payload_len);
+        checksum.writer().writeAll(payload) catch unreachable;
+
+        // Build the header and encode it directly into the header
+        const header: Header = .{
+            .tag = self.tag,
+            .payload_len = payload_len,
+            .crc32c = checksum.final(),
+        };
+        var header_writer: std.Io.Writer = .fixed(bytes[self.record_start..payload_start]);
+        header.encode(&header_writer) catch unreachable;
+    }
+
+    /// Discard this record. This makes it safe to use the underlying
+    /// alloating writer again as if nothing happened.
+    pub fn cancel(self: *Writer) void {
+        self.destination.shrinkRetainingCapacity(self.record_start);
+    }
+};
+
+/// Reads one complete record.
+///
+/// `init` decodes the header, `payloadReader` returns a reader limited to the
+/// declared payload, and `finish` verifies exact exhaustion and the CRC32C.
+pub const Reader = struct {
     header: Header,
+
+    // The limited reader normally streams directly into the hashing reader's
+    // buffer. One byte is enough for operations that require it to buffer,
+    // such as peek and discard.
+    limited_buffer: [1]u8,
+
+    // PAGE decoding performs many small reads. 256 bytes batches several cells
+    // while CRC32C is calculated without making Reader large on the stack.
+    hashing_buffer: [256]u8,
+
     limited: std.Io.Reader.Limited,
     hashing: std.Io.Reader.Hashed(Crc32c),
 
-    /// Caller-owned storage for the reader wrappers.
-    pub const Buffers = struct {
-        /// Buffer used to enforce the payload-length boundary.
-        limited: []u8,
-
-        /// Buffer used while updating CRC32C over consumed payload bytes.
-        hashing: []u8,
-    };
+    pub const InitError = Header.DecodeError;
 
     /// Errors detected after a payload decoder returns.
     pub const FinishError = error{
@@ -169,39 +239,40 @@ pub const PayloadReader = struct {
         PayloadNotExhausted,
     };
 
-    /// Initialize a reader for the payload described by `header`.
+    /// Decode a record header and initialize its payload reader.
     ///
-    /// `self` and both buffers must remain at stable addresses until `finish`
-    /// returns. Decode only through the reader returned by `reader`.
+    /// `self` must remain at a stable address until `finish` returns. Decode
+    /// the payload only through the reader returned by `payloadReader`.
     pub fn init(
-        self: *PayloadReader,
+        self: *Reader,
         source: *std.Io.Reader,
-        header: Header,
-        buffers: Buffers,
-    ) void {
+    ) InitError!void {
         self.* = undefined;
-        self.header = header;
+        self.header = try Header.decode(source);
         self.limited = .init(
             source,
-            .limited(header.payload_len),
-            buffers.limited,
+            .limited(self.header.payload_len),
+            &self.limited_buffer,
         );
 
-        const checksum: Checksum = .init(header.tag, header.payload_len);
+        const checksum: Checksum = .init(
+            self.header.tag,
+            self.header.payload_len,
+        );
         self.hashing = .init(
             &self.limited.interface,
             checksum.hashing.hasher,
-            buffers.hashing,
+            &self.hashing_buffer,
         );
     }
 
     /// Return the length-limited, checksum-updating payload reader.
-    pub fn reader(self: *PayloadReader) *std.Io.Reader {
+    pub fn payloadReader(self: *Reader) *std.Io.Reader {
         return &self.hashing.reader;
     }
 
     /// Require exact payload exhaustion and validate its CRC32C.
-    pub fn finish(self: *PayloadReader) FinishError!void {
+    pub fn finish(self: *Reader) FinishError!void {
         if (self.hashing.reader.bufferedLen() != 0 or
             self.limited.remaining != .nothing)
         {
@@ -282,7 +353,7 @@ test "reject every header truncation" {
     }
 }
 
-test "payload reader verifies exhaustion and checksum" {
+test "record reader verifies exhaustion and checksum" {
     const payload = "snapshot payload";
     var checksum: Checksum = .init(.page, payload.len);
     try checksum.writer().writeAll(payload);
@@ -292,23 +363,22 @@ test "payload reader verifies exhaustion and checksum" {
         .crc32c = checksum.final(),
     };
 
-    var source: std.Io.Reader = .fixed(payload ++ "next");
-    var payload_reader: PayloadReader = undefined;
-    var limited_buf: [1]u8 = undefined;
-    var hashing_buf: [1]u8 = undefined;
-    payload_reader.init(&source, header, .{
-        .limited = &limited_buf,
-        .hashing = &hashing_buf,
-    });
+    var encoded: [Header.len + payload.len + 4]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&encoded);
+    try header.encode(&writer);
+    try writer.writeAll(payload ++ "next");
 
+    var source: std.Io.Reader = .fixed(writer.buffered());
+    var record_reader: Reader = undefined;
+    try record_reader.init(&source);
     var decoded: [payload.len]u8 = undefined;
-    try payload_reader.reader().readSliceAll(&decoded);
-    try payload_reader.finish();
+    try record_reader.payloadReader().readSliceAll(&decoded);
+    try record_reader.finish();
     try std.testing.expectEqualStrings(payload, &decoded);
     try std.testing.expectEqualStrings("next", try source.take(4));
 }
 
-test "payload reader rejects remaining bytes and invalid checksum" {
+test "record reader rejects remaining bytes and invalid checksum" {
     const payload = "payload";
     const header: Header = .{
         .tag = .page,
@@ -316,35 +386,30 @@ test "payload reader rejects remaining bytes and invalid checksum" {
         .crc32c = 0,
     };
 
+    var encoded: [Header.len + payload.len]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&encoded);
+    try header.encode(&writer);
+    try writer.writeAll(payload);
+
     {
-        var source: std.Io.Reader = .fixed(payload);
-        var payload_reader: PayloadReader = undefined;
-        var limited_buf: [1]u8 = undefined;
-        var hashing_buf: [1]u8 = undefined;
-        payload_reader.init(&source, header, .{
-            .limited = &limited_buf,
-            .hashing = &hashing_buf,
-        });
-        _ = try payload_reader.reader().takeByte();
+        var source: std.Io.Reader = .fixed(writer.buffered());
+        var record_reader: Reader = undefined;
+        try record_reader.init(&source);
+        _ = try record_reader.payloadReader().takeByte();
         try std.testing.expectError(
             error.PayloadNotExhausted,
-            payload_reader.finish(),
+            record_reader.finish(),
         );
     }
 
     {
-        var source: std.Io.Reader = .fixed(payload);
-        var payload_reader: PayloadReader = undefined;
-        var limited_buf: [1]u8 = undefined;
-        var hashing_buf: [1]u8 = undefined;
-        payload_reader.init(&source, header, .{
-            .limited = &limited_buf,
-            .hashing = &hashing_buf,
-        });
-        try payload_reader.reader().discardAll(payload.len);
+        var source: std.Io.Reader = .fixed(writer.buffered());
+        var record_reader: Reader = undefined;
+        try record_reader.init(&source);
+        try record_reader.payloadReader().discardAll(payload.len);
         try std.testing.expectError(
             error.InvalidChecksum,
-            payload_reader.finish(),
+            record_reader.finish(),
         );
     }
 }
@@ -359,20 +424,58 @@ test "payload limit does not consume the next record" {
         .crc32c = checksum.final(),
     };
 
-    var source: std.Io.Reader = .fixed(payload ++ "next");
-    var payload_reader: PayloadReader = undefined;
-    var limited_buf: [1]u8 = undefined;
-    var hashing_buf: [1]u8 = undefined;
-    payload_reader.init(&source, header, .{
-        .limited = &limited_buf,
-        .hashing = &hashing_buf,
-    });
+    var encoded: [Header.len + payload.len + 4]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&encoded);
+    try header.encode(&writer);
+    try writer.writeAll(payload ++ "next");
 
+    var source: std.Io.Reader = .fixed(writer.buffered());
+    var record_reader: Reader = undefined;
+    try record_reader.init(&source);
     var too_long: [3]u8 = undefined;
     try std.testing.expectError(
         error.EndOfStream,
-        payload_reader.reader().readSliceAll(&too_long),
+        record_reader.payloadReader().readSliceAll(&too_long),
     );
-    try payload_reader.finish();
+    try record_reader.finish();
     try std.testing.expectEqualStrings("next", try source.take(4));
+}
+
+test "record writer appends and backpatches framing" {
+    var destination: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer destination.deinit();
+    try destination.writer.writeAll("prefix");
+
+    var record_writer = try Writer.init(&destination, .page);
+    try record_writer.payloadWriter().writeAll("payload");
+    try record_writer.finish();
+
+    const encoded = destination.written();
+    try std.testing.expectEqualStrings("prefix", encoded[0..6]);
+
+    var source: std.Io.Reader = .fixed(encoded[6..]);
+    var record_reader: Reader = undefined;
+    try record_reader.init(&source);
+    try std.testing.expectEqual(Tag.page, record_reader.header.tag);
+    try std.testing.expectEqual(
+        @as(u32, 7),
+        record_reader.header.payload_len,
+    );
+    try std.testing.expectEqualStrings(
+        "payload",
+        try record_reader.payloadReader().take(7),
+    );
+    try record_reader.finish();
+}
+
+test "record writer cancel preserves preceding bytes" {
+    var destination: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer destination.deinit();
+    try destination.writer.writeAll("prefix");
+
+    var record_writer = try Writer.init(&destination, .page);
+    try record_writer.payloadWriter().writeAll("partial");
+    record_writer.cancel();
+
+    try std.testing.expectEqualStrings("prefix", destination.written());
 }
